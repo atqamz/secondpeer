@@ -608,10 +608,9 @@ Deliverable: peer taps your shoulder, usefully, at most a few times a day.
 11. codex/grok adapters, stdio proxy, statusline.
 12. Docs, e2e, release pipeline.
 
-## Open decisions
+## Design decisions
 
-1. **Analyzer LLM default**: shell-out (`claude -p`) vs API mode. Recommendation: shell-out default (zero config, uses existing auth), with `api:anthropic` as opt-in for users who want lower latency and have an API key.
-2. **Proactive delivery aggressiveness**: how eagerly peer pushes observations. Recommendation: middle policy - push warnings only when idle (>=60s no activity), queue suggestions/info for drain at next turn, push critical immediately. Avoids both "invisible tool" and "noisy interruption".
+Design decisions for this project, including the LLM default and the proactive delivery default, are recorded in `DECISIONS.md`.
 
 ## Future considerations (post-v1)
 
