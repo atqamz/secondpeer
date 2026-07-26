@@ -23,7 +23,7 @@ Peer removes that tax.
 A zero-token Go daemon watches the filesystem and git state while the human codes.
 It accumulates a structured session narrative.
 On-demand tools (commit, review, explain, why, pr, ask) arrive pre-loaded with that context through MCP, callable from any harness or the CLI.
-A bounded-budget analyzer periodically reviews the human's work and queues observations: potential bugs, missed edge cases, test gaps, uncommitted-work nudges.
+A quota-gated analyzer periodically reviews the human's work and queues observations: potential bugs, missed edge cases, test gaps, uncommitted-work nudges.
 Session briefings restore continuity: where you left off, what happened while you were away.
 
 Peer is the inverse of secondhand.
@@ -35,7 +35,7 @@ The AI never writes code.
 
 1. **The human drives.** Peer never edits files, never commits without being asked, never opens PRs on its own. Every mutation is an explicit human request (via harness or CLI).
 2. **Watching is free.** The watcher layer (filesystem events, git state, session accounting) spends zero tokens. It must be able to run all day at negligible CPU cost.
-3. **Token spend is deliberate and bounded.** AI analysis runs on triggers with a daily budget. When the budget is gone, mechanical observations continue; analytical ones pause. No surprise bills.
+3. **Unasked work never competes with the human.** AI analysis runs on triggers, gated on how much of the human's own model quota is left. When the reserve floor is crossed, mechanical observations continue and analytical ones pause. On-demand tools are never gated: the human asked, so the human owns the spend.
 4. **MCP-first, CLI-always.** The primary interface is an MCP server any harness connects to. The CLI exposes the same operations for harness-free use. Adapters are thin; intelligence lives in the daemon.
 5. **Harness-agnostic everywhere.** Works with claude-code, opencode, pi, codex, grok. The analyzer's LLM access is a configurable command template, not a hardwired vendor SDK.
 6. **Quiet by default.** Observations queue; they do not interrupt. Only severity=critical pushes immediately. The human's flow state is the most expensive resource in the room.
@@ -56,7 +56,7 @@ The AI never writes code.
    |  watcher      fs events + git state        |  0 tokens
    |  store        sqlite session log           |  0 tokens
    |  rules        mechanical observations      |  0 tokens
-   |  analyzer     periodic AI review           |  budgeted tokens
+   |  analyzer     periodic AI review           |  quota-gated tokens
    |  observations queue + delivery policy      |
    |  MCP server   streamable HTTP, localhost   |
    |  events feed  SSE for adapters             |
@@ -76,7 +76,7 @@ The AI never writes code.
 Three modes of engagement:
 
 1. **Session lifecycle** (proactive, near-zero tokens): session-start briefing, away/return detection, checkpoint nudges.
-2. **Passive analysis** (proactive, budgeted tokens): periodic review of accumulated diff, observations queued by severity.
+2. **Passive analysis** (proactive, quota-gated tokens): periodic review of accumulated diff, observations queued by severity.
 3. **On-demand tools** (tokens on invoke): commit, review, explain, why, pr, rebase, ask.
 
 ## Directory layout
@@ -99,10 +99,11 @@ secondpeer/
   internal/
     watcher/                # fsnotify tree watch, debounce, gitignore filtering
     gitstate/               # git CLI shell-outs: status, diff, log, blame
-    store/                  # sqlite (modernc.org/sqlite): events, activity, observations, sessions, analyses
+    store/                  # sqlite (modernc.org/sqlite): events, activity, observations, sessions, clients, analyses, spend
     narrative/              # derive compact session narrative from store
     rules/                  # mechanical observation rules (zero token)
-    analyzer/               # triggers, budget, prompt assembly, LLM runner
+    analyzer/               # triggers, prompt assembly, LLM runner
+    budget/                 # quota probe, reserve floor, run cap, spend accounting
     llm/                    # command-template LLM invocation (claude -p et al)
     observations/           # queue, dedup, severity, delivery policy, staleness
     mcpserver/              # MCP streamable HTTP server + stdio proxy mode
@@ -192,7 +193,7 @@ peer connect all
 ```
 
 Behavior:
-- claude: run `claude mcp add --transport http --scope user peer http://127.0.0.1:7433/mcp`; merge hook entries into `~/.claude/settings.json` (SessionStart -> `peer hook claude session-start`, UserPromptSubmit -> `peer hook claude user-prompt-submit`, Stop -> `peer hook claude stop`); optional statusline snippet.
+- claude: run `claude mcp add --transport http --scope user peer http://127.0.0.1:7433/mcp`; merge hook entries into `~/.claude/settings.json` (SessionStart -> `peer hook claude session-start`, UserPromptSubmit -> `peer hook claude user-prompt-submit`, Stop -> `peer hook claude stop`, SessionEnd -> `peer hook claude session-end`); optional statusline snippet.
 - opencode: add MCP entry to `~/.config/opencode/opencode.json`; install `peer-observe.js` plugin into `~/.config/opencode/plugins/`.
 - pi: install `peer-observe.ts` extension; add MCP entry if pi supports MCP, otherwise extension registers thin wrapper tools that shell out to `peer` CLI.
 - codex/grok: add MCP entry to their config; merge hooks fragments.
@@ -200,17 +201,30 @@ Behavior:
 
 ---
 
-### `peer status`
+### `peer status [--json]`
 
 One-screen daemon and session overview.
+`--json` emits the same state machine-readably, including per-purpose spend totals.
 
 ```
 daemon      running (pid 8412, 2 projects, up 6h)
 mcp         http://127.0.0.1:7433/mcp (3 clients)
 project     nsr        branch fix-auth   dirty 4 files   last edit 2m ago
 project     yes2infra  branch main       clean           idle 3h
-analyzer    standard | today: 14.2k/100k tokens | last run 12m ago
+analyzer    standard | runway 61% (resets 2h14m) | 6/24 runs today | ~38k tokens | last run 12m ago
 queue       2 observations (1 warning, 1 suggestion)
+```
+
+When the reserve floor is crossed the analyzer line names the reason and the recovery time:
+
+```
+analyzer    paused: runway 22% below floor 30% (resets 1h03m) | mechanical rules active
+```
+
+When no quota probe is configured the line says so, so the missing defense is visible rather than silent:
+
+```
+analyzer    standard | no quota probe configured (runs/day only) | 6/24 runs today | last run 12m ago
 ```
 
 ---
@@ -223,13 +237,13 @@ Sections, assembled zero-token except the optional narration pass:
 1. Where you left off: last session summary + last edited files.
 2. Git: branch, dirty files, last commit (relative age), ahead/behind upstream.
 3. External (requires gh, config `brief.remote_checks`): open PRs authored/assigned, CI status of last pushed branch.
-4. Queued observations (drains them as delivered).
+4. Pending observations for the requesting client (advances that client's cursor).
 
 ---
 
 ### `peer observe [--drain] [--min-severity <s>] [--json]`
 
-List queued observations. `--drain` marks them delivered.
+List queued observations. `--drain` advances the `cli` client's cursor past them, and no other client's, so reading the queue in a terminal never hides it from an open harness window.
 
 ```
 warning     auth.go:88 new branch on error path returns nil err (rule: ai-analysis, 12m ago)
@@ -281,7 +295,7 @@ Errors:
 
 ### `peer review [flags]`
 
-Review uncommitted work (tokens on demand, not budget-gated).
+Review uncommitted work (tokens on demand, never gated).
 
 ```
 peer review                # unstaged + staged vs HEAD
@@ -291,7 +305,7 @@ peer review --focus "error handling"
 
 Sends diff + session narrative to the LLM runner with a review prompt.
 Output: findings with file:line, severity, one-line rationale.
-Findings are also recorded as delivered observations (so the analyzer never re-flags them).
+Findings are also queued as observations with `suppress_delivery` set, so the analyzer never re-flags them and no client is told twice.
 
 ---
 
@@ -349,10 +363,20 @@ Sub-second, no LLM calls.
 
 ```
 peer hook claude session-start     # -> {"hookSpecificOutput":{"additionalContext": "<brief>"}}
-peer hook claude user-prompt-submit# -> queued observations as additionalContext (drains queue)
-peer hook claude stop              # -> session accounting; never blocks stop
+peer hook claude user-prompt-submit# -> this client's pending observations as additionalContext
+peer hook claude stop              # -> harness idle signal; never blocks stop
+peer hook claude session-end       # -> update client last_seen
 peer hook codex ...                # same pattern, codex payload shapes
 ```
+
+Event mapping, given that a harness client is not a work session:
+
+| Event | Effect |
+|---|---|
+| SessionStart | return the briefing, register or update the client; does not start a work session |
+| UserPromptSubmit | deliver this client's pending observations; counts as a liveness signal |
+| Stop | harness idle signal feeding the delivery policy's idle condition; no accounting (Stop fires on every agent turn, not once per session) |
+| SessionEnd | update the client's `last_seen`; never closes the work session |
 
 ---
 
@@ -363,7 +387,7 @@ Standard. `peer update` follows the secondhand/no-mistakes/treehouse pattern (Gi
 ## MCP server specification
 
 Transport: streamable HTTP at `http://127.0.0.1:7433/mcp` (config `mcp.port`), built on the official `modelcontextprotocol/go-sdk`.
-One daemon serves many concurrent harness sessions; sessions are distinguished per MCP session id.
+One daemon serves many concurrent harness clients; clients are distinguished per MCP session id and each carries its own observation cursor (see `## Session continuity`).
 `peer mcp-stdio` runs a stdio-to-daemon proxy for clients without HTTP support; the proxy forwards its own cwd so the daemon can route the session to the right project.
 The server does not depend on MCP sampling, resource subscriptions, or server-push notifications for anything load-bearing: no target harness implements the client side, and the 2026-07-28 spec revision deprecates sampling/roots/logging outright.
 When the claude Channels adapter is enabled, the server additionally declares the experimental `claude/channel` capability (an Anthropic extension, not core MCP).
@@ -392,6 +416,7 @@ Design rules:
 - Tools that spend tokens say so in their description.
 - `commit` and `pr_create` carry destructive annotations so harnesses can gate them behind approval.
 - Structured content: tools return both human text and structured JSON (outputSchema) so harnesses can render or post-process.
+- `observations` returns what is pending for the calling client, and `drain` advances that client's cursor alone. `briefing` does the same for the observations it embeds.
 
 Resources (optional, for clients that support them):
 - `peer://briefing` and `peer://activity` mirror the corresponding tools for @-mention style inclusion.
@@ -409,7 +434,7 @@ Adapters subscribe and inject according to harness capability.
 |---|---|---|
 | pi | extension subscribes to SSE, injects via `pi.sendMessage(..., {deliverAs: "steer", triggerTurn: true})` | push |
 | opencode | plugin subscribes to SSE, injects via `client.session.promptAsync` | push |
-| claude-code (stable) | hooks pull: SessionStart injects briefing, UserPromptSubmit drains queue into additionalContext; statusline shows queue depth ambiently | pull-at-turn |
+| claude-code (stable) | hooks pull: SessionStart injects briefing, UserPromptSubmit delivers that client's pending observations into additionalContext; statusline shows queue depth ambiently | pull-at-turn |
 | claude-code (preview) | Channels: MCP server declares experimental `claude/channel` capability; off by default until the feature exits research preview | push |
 | codex | hooks.json pull (UserPromptSubmit stdout context); `notify` key for desktop-notification degrade | pull-at-turn |
 | grok | hooks pull (event taxonomy mirrors claude; additionalContext support unconfirmed, verify before enabling) | pull-at-turn |
@@ -418,10 +443,10 @@ Adapters subscribe and inject according to harness capability.
 
 Delivery policy (daemon-side, adapters stay dumb):
 - critical: push immediately on every available channel.
-- warning: push only when the session is idle (harness idle event or >=60s no activity); otherwise queue.
-- suggestion/info: queue only; drained at next turn, next brief, or explicit `observe`.
+- warning: push only when the session is idle (a harness Stop event or >=60s with no signal); otherwise queue.
+- suggestion/info: queue only; delivered at that client's next turn, next brief, or explicit `observe`.
 - Staleness: before delivery, re-verify the observation's file fingerprint; drop if the code changed.
-- Dedup: fingerprint(rule, file, normalized finding); once delivered or dismissed, never repeat.
+- Dedup: fingerprint(rule, file, normalized finding); once an observation with that fingerprint has been queued, it is never queued again, whether or not any client has seen it.
 
 ## Watcher specification
 
@@ -430,12 +455,12 @@ Delivery policy (daemon-side, adapters stay dumb):
 - macOS note: fsnotify uses kqueue (one fd per watched item), so the gitignore filter matters even more there; inotify watch exhaustion on Linux degrades that project to polling with a warning observation.
 - Git state files watched directly for instant signals: `.git/HEAD`, `.git/index`, `refs/heads/`, `MERGE_HEAD`, `REBASE_HEAD`, `FETCH_HEAD`.
 - Reconciliation: `git status --porcelain=v2` at most every 30s and after git events; churn via `git diff --numstat` on quiescence, never per event.
-- Away detection: no events for `session.away_threshold` (default 15m) => away; next event => return.
+- Away detection: no signal of any kind for `session.away_threshold` (default 15m) => away; next signal => return. The watcher is one signal source among several; see `## Session continuity`.
 - Watch limits: on inotify exhaustion, log, fall back to polling that project, surface a warning observation.
 
 ## Analyzer specification
 
-Triggers (all subject to `min_interval`, default 10m, and the daily budget):
+Triggers (all subject to `min_interval`, default 10m, and the budget gate):
 - quiescence: an edit burst (>=3 saves) followed by >=2m of silence.
 - volume: >=`analysis.file_threshold` files or >=`analysis.line_threshold` changed lines since last analysis.
 - staged: the index grew (imminent commit; jump the queue).
@@ -446,11 +471,62 @@ Output contract: JSON array of `{severity, title, detail, file, line?, confidenc
 
 What it looks for (prompt profile, config-selectable): potential bugs, missed edge cases, test gaps, style drift vs the surrounding file, dead/leftover debug code.
 
-Budget: `analysis.daily_tokens` (default 100k), spend recorded per run in the store; intensity presets set trigger thresholds + model:
+Every run is gated by the budget gate below.
+Intensity presets set trigger thresholds and model tier:
 - off: no analyzer, mechanical rules only.
 - light: staged trigger only, small model.
 - standard (default): all triggers, small model.
 - eager: all triggers, tighter intervals, mid model.
+
+## Budget gate
+
+The scarce resource under the default cost model is not money, it is the human's own rolling model quota.
+Peer shells out to the locally installed `claude` binary, so a background analysis run consumes the same subscription window the human's own coding sessions draw on.
+The gate exists so peer's unasked work is never the reason the human runs out mid-task.
+Money remains a concern only in `api:anthropic` runner mode, where calls are metered per token.
+
+`internal/budget` owns the probe, the gate, and spend accounting.
+It shares the command-template execution helper with `internal/llm` rather than duplicating it.
+
+### Quota probe
+
+`budget.quota_command` is a command template in the same style as `llm.command`.
+Peer does not know how to read any vendor's local quota state; it asks a command the user configures.
+Expected stdout, extra fields ignored:
+
+```json
+{"remaining_percent": 42.0, "resets_at": "2026-08-02T18:00:00Z"}
+```
+
+The probe runs with a 2s timeout and its result is cached for `budget.probe_cache` (default 60s).
+A missing command, non-zero exit, unparseable output, or an out-of-range percent all mean "no reading" and are logged at most once per hour.
+Without `resets_at` the gate still applies; `peer status` shows the reset time as unknown.
+
+The default is empty, so peer ships without assuming any vendor or any installed helper.
+Because that leaves the gate with no reading out of the box, `peer status` and the first daemon run print one line naming the gap.
+
+### Gate
+
+The gate is evaluated once immediately before each background analyzer run, and nowhere else.
+
+- Reading present and `remaining_percent` below `budget.reserve_floor` (default 30): skip the run. The analyzer stays paused until a later probe clears the floor.
+- No reading: allow the run, bounded only by the run cap.
+- `budget.max_runs_per_day` (default 24, counter resets at local midnight) applies in both cases, so it also serves as the runaway backstop against a trigger bug.
+
+Probe failure fails open to the run cap, consistent with the rule that observation-side errors degrade rather than block.
+Crossing the floor while a run is in flight does not abort it.
+
+On-demand tools (`commit`, `review`, `explain`, `why`, `pr`, `ask`) never consult the gate.
+When a reading is below the floor they append one runway line to their output.
+They never prompt and never refuse.
+
+### Accounting
+
+The runner extracts usage from its own JSON output where the mode reports it and records one row per call in the `spend` table, tagged with the purpose that requested it (analysis, commit, review, explain, ask).
+Every call is recorded, on-demand ones included, so the accounting covers all of peer's spend rather than only the part it gates.
+The analyzer line in `peer status` reports the analysis purpose alone; the totals are available through `peer status --json`.
+On the subscription path this accounting gates nothing; it exists so `peer status` can answer what peer cost.
+`analysis.daily_tokens` is enforced only in `api:anthropic` mode, where it is a real bill, and defaults to 0 meaning unlimited.
 
 ## LLM runner
 
@@ -463,6 +539,7 @@ claude -p --output-format json --model {model} {prompt}
 Template variables: `{model}`, `{prompt}` (or stdin).
 Alternatives documented: `opencode run --format json`, `codex exec`, or `api:anthropic` mode using an API key.
 Timeouts, JSON extraction, and retry-once semantics live in the runner.
+The runner also extracts reported usage from the response and hands it to `internal/budget` for accounting.
 Per-purpose model map: `llm.models.analysis`, `llm.models.commit`, `llm.models.review`, `llm.models.explain` (small/mid tiers by default).
 
 ## Mechanical rules (zero token)
@@ -482,11 +559,39 @@ Each rule: one Go function over watcher/git state, individually toggleable in co
 
 ## Session continuity
 
-- A session = contiguous activity window per project (bounded by away gaps or harness SessionStart/Stop signals when available).
-- At session end (away > threshold or hook signal): write a compact summary row (files touched, churn, commits made, observations delivered, one-line LLM narration when budget allows).
-- Persisted: sessions, summaries, undelivered + delivered observations, analysis findings history, budget counters.
+Peer has exactly one kind of session.
+A **work session** is a contiguous activity window per project, owned by the watcher, and it exists whether or not any harness is running.
+Harness connections are **clients**, never sessions: a client attaches to whatever work session is in progress, and several clients can attach to the same one.
+This is what makes peer's account of the day identical whether the human worked in an editor alone, in one claude window, or in three at once.
+
+### Work sessions
+
+- Liveness is one `last_signal_at` per project, fed by every peer-visible signal: debounced file saves, git state changes, harness hook events, MCP tool calls, and CLI invocations.
+- Away when no signal for `session.away_threshold` (default 15m); return on the next signal, with the gap recorded on the session.
+- A session closes on an away-threshold crossing or on daemon shutdown, and on nothing else. No harness signal ever closes one: a claude window closing is not the human stopping work.
+- At session close: write a compact summary row (files touched, churn, commits made, observations delivered, one-line LLM narration when the budget gate allows).
+- "Where you left off" in a briefing is the last closed work session for that project, so there is no tiebreak to make.
+
+### Clients
+
+- Table `clients`: `(id, harness, project, first_seen, last_seen, cursor)`, keyed per client-and-project pair.
+- Identity is the MCP session id for MCP clients, the harness payload's session id for hook shims, and the fixed pseudo-id `cli` for the CLI.
+- A new client's cursor initializes to the first observation id of the work session in progress, or to the next id to be issued when the session has queued none yet. It sees the session it is joining and no older backlog.
+- Clients unseen for 7 days are pruned; a returning id re-initializes exactly like a new one.
+
+### Observation delivery
+
+- Observations are an append-only log with monotonic ids.
+- A client receives observations with `id > cursor`, minus globally dismissed, minus stale by fingerprint re-check, minus those below its severity floor. The cursor advances past everything considered, whether or not each item passed the filters.
+- Dismissal and staleness are global. The cursor only records who has seen what, so two windows on one project each receive an observation exactly once and neither hides it from the other.
+- Analyzer suppression keys on the fingerprint of any observation ever queued, independent of who has seen it.
+- `peer review` findings are queued with `suppress_delivery` set: they exist so the analyzer will not re-flag them, and no cursor ever delivers them.
+
+### Persistence
+
+- Persisted: sessions, summaries, clients and their cursors, observations with their dismissal state, analysis findings history, run-cap and spend counters.
 - Re-derived live, never persisted: git status, branch, diff, PR/CI state.
-- Retention: raw events pruned after `store.retain_days` (default 14); sessions/observations kept 90 days; store vacuumed weekly.
+- Retention: raw events pruned after `store.retain_days` (default 14); sessions, observations, and spend rows kept 90 days; clients pruned after 7 days unseen; store vacuumed weekly.
 
 ## Configuration (`~/.config/peer/config.toml`)
 
@@ -504,10 +609,16 @@ explain  = "sonnet"
 
 [analysis]
 intensity = "standard"     # off | light | standard | eager
-daily_tokens = 100000
+daily_tokens = 0           # api:anthropic mode only; 0 = unlimited
 min_interval = "10m"
 min_confidence = 0.6
 max_observations = 5
+
+[budget]
+quota_command = ""         # e.g. "quota-axi claude --json"; empty = no probe
+reserve_floor = 30         # percent remaining; below this, background analysis pauses
+max_runs_per_day = 24      # bound when no probe; also the runaway backstop
+probe_cache = "60s"
 
 [session]
 away_threshold = "15m"
@@ -527,10 +638,11 @@ auto_register = true
 ```
 
 Per-project `.peer.toml` may override `[analysis]`, `[rules]`, `[watch]`, `[brief]`.
+`[budget]` is user-global and not overridable per project: the quota it defends is shared across every project the daemon watches.
 
 ## State management
 
-- Single sqlite database (modernc.org/sqlite, pure Go, WAL mode). Tables: events, file_activity, observations, sessions, analyses, projects, kv.
+- Single sqlite database (modernc.org/sqlite, pure Go, WAL mode). Tables: events, file_activity, observations, sessions, clients, analyses, spend, projects, kv.
 - The daemon is the only writer. CLI and hook shims talk to the daemon over the control socket; they never open the db for writes (read-only fallback when the daemon is down: status/activity still work).
 - Atomic config edits (temp + rename). No lock files beyond the daemon pidfile flock.
 
@@ -544,9 +656,11 @@ Per-project `.peer.toml` may override `[analysis]`, `[rules]`, `[watch]`, `[brie
 
 ## Testing strategy
 
-- Unit: debounce/coalesce, gitignore filtering, rule engine table tests, narrative derivation, budget accounting, prompt assembly (golden files), message generation JSON parsing, config validation, observation dedup/staleness.
+- Unit: debounce/coalesce, gitignore filtering, rule engine table tests, narrative derivation, prompt assembly (golden files), message generation JSON parsing, config validation, observation dedup/staleness.
+- Budget: gate table tests across reading-present, reading-absent, and floor-boundary equality; run-cap rollover at local midnight; usage extraction from recorded runner output.
+- Sessions and delivery: liveness per signal kind; away and return at the threshold boundary; cursor initialization for a client arriving mid-session and for one arriving before any session exists; two clients each receiving an observation exactly once; a dismissed observation skipped by both cursors; cursor advancing past filtered items; client prune and re-registration.
 - Integration: temp git repos with scripted edit sequences -> expected events/aggregates/rules; daemon lifecycle (start, signal handling, single-instance); MCP server exercised with an MCP client library (list/call each tool); hook shims with recorded harness payloads.
-- LLM calls mocked via the command template (point `llm.command` at a fixture script).
+- LLM calls mocked via the command template (point `llm.command` at a fixture script); the quota probe mocked the same way, with fixtures for ok, malformed, timeout, and non-zero exit.
 - e2e (tagged): real `claude -p` smoke test for commit message generation, real `gh` mocked.
 
 ## What is NOT in scope
@@ -598,7 +712,7 @@ Deliverable: run the daemon for a day, `peer activity` tells the true story of t
 Deliverable: from inside claude-code, "commit this" produces a context-aware commit through peer.
 
 ### Phase 3: proactive loop
-7. Analyzer: triggers, budget, prompt, observation output.
+7. Analyzer: triggers, budget gate (probe, floor, run cap, accounting), prompt, observation output.
 8. Briefing assembly + away/return summaries (+ gh remote checks).
 9. Delivery policy + SSE feed + opencode plugin + pi extension + desktop fallback.
 Deliverable: peer taps your shoulder, usefully, at most a few times a day.
@@ -608,10 +722,9 @@ Deliverable: peer taps your shoulder, usefully, at most a few times a day.
 11. codex/grok adapters, stdio proxy, statusline.
 12. Docs, e2e, release pipeline.
 
-## Open decisions
+## Design decisions
 
-1. **Analyzer LLM default**: shell-out (`claude -p`) vs API mode. Recommendation: shell-out default (zero config, uses existing auth), with `api:anthropic` as opt-in for users who want lower latency and have an API key.
-2. **Proactive delivery aggressiveness**: how eagerly peer pushes observations. Recommendation: middle policy - push warnings only when idle (>=60s no activity), queue suggestions/info for drain at next turn, push critical immediately. Avoids both "invisible tool" and "noisy interruption".
+Design decisions for this project, including the LLM default and the proactive delivery default, are recorded in `DECISIONS.md`.
 
 ## Future considerations (post-v1)
 
