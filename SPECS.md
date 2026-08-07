@@ -1,6 +1,6 @@
 # Peer
 
-You code. It watches, remembers, and helps.
+You code. Peer keeps up.
 
 Repo: `secondpeer`
 CLI: `peer`
@@ -14,70 +14,89 @@ Nothing solves "the human writes the code and the AI keeps up".
 
 When the human drives, today's tools offer two bad options:
 
-1. **Autocomplete-class assistants** (Copilot, editor plugins): keystroke-level, editor-locked, no session memory, no git awareness, no judgment about the shape of the work.
-2. **Chat-class agents** (claude-code, opencode, codex): powerful but blank. Every session starts cold. The agent knows nothing about the 40 minutes of editing you just did unless you paste it in. Asking for a commit message means re-explaining what you changed and why.
+1. **Autocomplete-class assistants** (Copilot, editor plugins): keystroke-level, editor-locked, weak continuity, and little judgment about the shape of a work session.
+2. **Chat-class agents** (claude-code, opencode, codex): powerful but usually arrive cold. They know the current conversation, not necessarily the 40 minutes of editing, failed approaches, decisions, and git state that happened before the question.
 
-The human pays a context tax on every interaction: the assistant was not watching.
+The human pays a context tax on every interaction: the assistant was not there for the work.
 
 Peer removes that tax.
-A zero-token Go daemon watches the filesystem and git state while the human codes.
-It accumulates a structured session narrative.
-On-demand tools (commit, review, explain, why, pr, ask) arrive pre-loaded with that context through MCP, callable from any harness or the CLI.
-A quota-gated analyzer periodically reviews the human's work and queues observations: potential bugs, missed edge cases, test gaps, uncommitted-work nudges.
-Session briefings restore continuity: where you left off, what happened while you were away.
+A zero-token Go daemon watches filesystem, git, and harness signals while the human codes.
+It stores structured evidence and work context in SQLite: activity, current goal, direction, decisions, open questions, attempts, and outcomes.
+On-demand tools (commit, review, explain, why, pr, ask) arrive pre-loaded with that context through MCP or the CLI.
+A quota-gated analyzer periodically reviews both the code and the shape of the work, then records observations: bugs, missed edge cases, test gaps, repeated failed approaches, scope drift, stale assumptions, and unfinished threads.
+Session briefings restore continuity: what the human was trying to do, where the work stopped, and what still deserves attention.
 
 Peer is the inverse of secondhand.
 Secondhand: AI crews write code, human approves.
-Peer: human writes code, AI watches and assists.
-The AI never writes code.
+Peer: human writes code, AI watches, remembers, reasons, and assists.
+
+Peer may suggest an implementation, including complete source code or a patch-shaped answer. It never writes those suggestions into implementation files. The human remains the author who types, pastes, or otherwise applies code changes.
 
 ## Core principles
 
-1. **The human drives.** Peer never edits files, never commits without being asked, never opens PRs on its own. Every mutation is an explicit human request (via harness or CLI).
-2. **Watching is free.** The watcher layer (filesystem events, git state, session accounting) spends zero tokens. It must be able to run all day at negligible CPU cost.
-3. **Unasked work never competes with the human.** AI analysis runs on triggers, gated on how much of the human's own model quota is left. When the reserve floor is crossed, mechanical observations continue and analytical ones pause. On-demand tools are never gated: the human asked, so the human owns the spend.
-4. **MCP-first, CLI-always.** The primary interface is an MCP server any harness connects to. The CLI exposes the same operations for harness-free use. Adapters are thin; intelligence lives in the daemon.
-5. **Harness-agnostic everywhere.** Works with claude-code, opencode, pi, codex, grok. The analyzer's LLM access is a configurable command template, not a hardwired vendor SDK.
-6. **Quiet by default.** Observations queue; they do not interrupt. Only severity=critical pushes immediately. The human's flow state is the most expensive resource in the room.
-7. **Local and private.** All state on disk, no telemetry, no cloud component. Sensitive files (secrets, keys) are never read, never included in narratives or analysis payloads.
-8. **One binary.** Daemon, MCP server, CLI, hook shims: all `peer`. No shell scripts, no runtime dependencies beyond git (and optionally gh).
+These are product contracts. They should survive changes in protocols, models, and harnesses.
+
+1. **You code.** Peer never edits implementation files or takes ownership of implementation. It may explain, critique, sketch, or provide complete code for the human to apply. Git mutations such as commit or PR creation happen only on explicit human request.
+2. **Peer keeps up.** Context is accumulated continuously so the human does not have to re-explain the work every time a harness starts or a question is asked.
+3. **Peer understands the work.** Activity alone is not enough. Peer tracks the current goal, direction, decisions, open questions, attempts, outcomes, and their provenance, alongside filesystem and git evidence.
+4. **Peer speaks when useful.** Relevance beats frequency. Critical findings may interrupt; everything else respects an explicit attention budget and prefers idle moments, batching, or the next natural turn.
+5. **Peer remembers for the human, not against them.** Memory is local, structured, inspectable, attributable, and deletable. Summaries are derived conveniences, never opaque canonical truth.
+
+## Architecture principles
+
+1. **Watching is free.** Filesystem events, git state, session accounting, deterministic rules, and normal context queries spend zero model tokens and should run all day at negligible CPU cost.
+2. **Unasked work never competes with the human.** Background AI is quota-gated. On-demand tools are never gated because the human explicitly chose the spend.
+3. **Context first, interfaces second.** The daemon and SQLite context store own the intelligence. MCP is the primary harness interface and the CLI always exposes the same core operations; adapters stay thin.
+4. **Harness-agnostic everywhere.** Claude Code, OpenCode, Pi, Codex, Grok, or future clients attach to the same work context. The LLM runner is a configurable command template, not a vendor SDK baked into the design.
+5. **Structured memory over vibe retrieval.** Canonical memory is typed relational data with provenance and relations. Common retrieval is deterministic SQL; LLMs may compose read-only SQL against stable views when the query is genuinely semantic. No vector store is required for v1.
+6. **No Peer cloud service.** State is stored locally and Peer has no telemetry/backend. Model calls follow the privacy boundary of the configured runner and are sanitized before leaving the daemon.
+7. **One binary.** Daemon, MCP server, CLI, hook shims, query guard, and adapters' installer entrypoints are all `peer`. Runtime dependencies are git and optionally gh plus the configured model runner.
 
 ## Architecture overview
 
+Context is the product. Watchers, SQLite, analyzers, MCP, and CLI are mechanisms for keeping that context accurate and useful.
+
 ```
-                 human (writes all code, any editor)
-                    |
-        edits files / runs git
-                    |
-                    v
-   +--------------------------------------------+
-   | peer daemon (one per user, always running) |
-   |                                            |
-   |  watcher      fs events + git state        |  0 tokens
-   |  store        sqlite session log           |  0 tokens
-   |  rules        mechanical observations      |  0 tokens
-   |  analyzer     periodic AI review           |  quota-gated tokens
-   |  observations queue + delivery policy      |
-   |  MCP server   streamable HTTP, localhost   |
-   |  events feed  SSE for adapters             |
-   +---+----------------+----------------+------+
-       |                |                |
-       v                v                v
-  MCP tools        adapters          peer CLI
-  (any harness)    (push/pull        (harness-free)
-  commit, review,   injection:       same verbs
-  explain, why,     claude hooks,
-  pr, ask, brief,   opencode plugin,
-  observe,          pi extension,
-  activity          codex/grok hooks,
-                    desktop notify)
+                    human
+             writes / thinks / tests
+                      |
+        files + git + harness signals
+                      |
+                      v
+   +------------------------------------------------+
+   | peer daemon (one per user, always running)     |
+   |                                                |
+   | evidence                                       |
+   |   watcher + gitstate + harness signals   0 tok |
+   |                                                |
+   | context                                        |
+   |   SQLite typed memory                    0 tok |
+   |   activity / goal / direction / decisions      |
+   |   questions / attempts / outcomes / relations  |
+   |                                                |
+   | awareness                                      |
+   |   rules                                  0 tok |
+   |   analyzer                    quota-gated tok  |
+   |   observations + attention policy              |
+   |                                                |
+   | assistance                                     |
+   |   commit / review / explain / why / pr / ask   |
+   |                                                |
+   | interfaces                                     |
+   |   MCP + CLI + SSE/hooks/adapters               |
+   +------------------------+-----------------------+
+                            |
+             +--------------+--------------+
+             |              |              |
+             v              v              v
+          harnesses      peer CLI      notifications
 ```
 
 Three modes of engagement:
 
-1. **Session lifecycle** (proactive, near-zero tokens): session-start briefing, away/return detection, checkpoint nudges.
-2. **Passive analysis** (proactive, quota-gated tokens): periodic review of accumulated diff, observations queued by severity.
-3. **On-demand tools** (tokens on invoke): commit, review, explain, why, pr, rebase, ask.
+1. **Ambient continuity** (proactive, near-zero tokens): activity tracking, work-context retrieval, session/away continuity, deterministic rules, briefings.
+2. **Passive awareness** (proactive, quota-gated tokens): periodic review of both code changes and work patterns, producing observations subject to the attention budget.
+3. **On-demand assistance** (tokens on invoke where needed): commit, review, explain, why, pr, rebase, ask, plus read-only structured-memory queries.
 
 ## Directory layout
 
@@ -94,15 +113,19 @@ secondpeer/
     connect.go              # register MCP server + adapters with harnesses
     hook.go                 # hook shim subcommands (claude/codex/grok stdin-json)
     commit.go review.go explain.go why.go pr.go ask.go rebase.go
-    observe.go brief.go activity.go
+    observe.go brief.go activity.go focus.go context.go memory.go
     config.go update.go
   internal/
     watcher/                # fsnotify tree watch, debounce, gitignore filtering
     gitstate/               # git CLI shell-outs: status, diff, log, blame
-    store/                  # sqlite (modernc.org/sqlite): events, activity, observations, sessions, clients, analyses, spend
+    store/                  # sqlite canonical memory + migrations + stable query views
+    workcontext/            # typed facts: goal, direction, decisions, questions, attempts, outcomes
+    memory/                 # read-only SQL guard, retrieval, retention, forget/reset
     narrative/              # derive compact session narrative from store
     rules/                  # mechanical observation rules (zero token)
-    analyzer/               # triggers, prompt assembly, LLM runner
+    analyzer/               # code + work analysis, triggers, prompt assembly
+    attention/              # human-level presentation state, routing, batching, interruption budget
+    privacy/                # exclusion, secret redaction, outbound context inspection
     budget/                 # quota probe, reserve floor, run cap, spend accounting
     llm/                    # command-template LLM invocation (claude -p et al)
     observations/           # queue, dedup, severity, delivery policy, staleness
@@ -203,16 +226,18 @@ Behavior:
 
 ### `peer status [--json]`
 
-One-screen daemon and session overview.
-`--json` emits the same state machine-readably, including per-purpose spend totals.
+One-screen daemon and work overview.
+`--json` emits the same state machine-readably, including per-purpose spend and attention totals.
 
 ```
 daemon      running (pid 8412, 2 projects, up 6h)
 mcp         http://127.0.0.1:7433/mcp (3 clients)
 project     nsr        branch fix-auth   dirty 4 files   last edit 2m ago
+focus       fix token refresh race | explicit | direction: move ownership to SessionManager
 project     yes2infra  branch main       clean           idle 3h
 analyzer    standard | runway 61% (resets 2h14m) | 6/24 runs today | ~38k tokens | last run 12m ago
-queue       2 observations (1 warning, 1 suggestion)
+attention   2/4 proactive interruptions today | last 48m ago
+queue       2 unresolved observations (1 warning, 1 suggestion)
 ```
 
 When the reserve floor is crossed the analyzer line names the reason and the recovery time:
@@ -229,28 +254,65 @@ analyzer    standard | no quota probe configured (runs/day only) | 6/24 runs tod
 
 ---
 
+### `peer focus [<text>|clear]` / `peer context [flags]`
+
+`peer focus` exposes the current goal anchor.
+
+```
+peer focus
+peer focus "fix multiplayer reconnect after race"
+peer focus clear
+```
+
+With no argument it prints the active goal, whether it is explicit or inferred, its confidence, provenance, current direction, and unresolved questions.
+An explicit human-set focus outranks all inferred context and remains active until cleared, superseded, or the project is forgotten.
+When no explicit focus exists, inference may use harness prompts, linked issue/PR metadata, branch names, commits, and recent work evidence in that order; inferred facts always carry source and confidence.
+
+`peer context` prints the structured current work context: goal, direction, recent decisions, open questions, attempts, outcomes, and activity summary.
+`peer context --purpose <analysis|commit|review|explain|ask>` prints the exact sanitized context payload that would be supplied to that model purpose, after exclusions and secret redaction. It never invokes a model.
+
+---
+
+### `peer memory [--project <p>]` / `peer memory query <sql>` / `peer forget ...`
+
+Memory is inspectable and user-owned.
+
+```
+peer memory
+peer memory query 'SELECT kind, text, source_type FROM memory_facts WHERE status = "active"'
+peer forget session <id>
+peer forget project <name>
+peer reset --all
+```
+
+`peer memory` shows retained structured facts and their provenance, not a prose blob.
+`peer memory query` executes read-only SQL against documented stable memory views; see `## Structured memory and work context`.
+`peer forget` deletes the selected retained memory and derived summaries. `peer reset --all` removes all Peer state after explicit confirmation (or `--yes`). Neither command touches the project working tree.
+
 ### `peer brief [--project <p>]`
 
-Print the session briefing (same content the harness gets at SessionStart).
+Print the work briefing (same content a harness gets at SessionStart).
 
-Sections, assembled zero-token except the optional narration pass:
-1. Where you left off: last session summary + last edited files.
-2. Git: branch, dirty files, last commit (relative age), ahead/behind upstream.
-3. External (requires gh, config `brief.remote_checks`): open PRs authored/assigned, CI status of last pushed branch.
-4. Pending observations for the requesting client (advances that client's cursor).
+Sections, assembled from structured state except an optional narration pass:
+1. Work context: current goal, direction, recent decisions, open questions, last outcome, likely next thread.
+2. Where you left off: last work-session summary + last edited files and meaningful away gap.
+3. Git: branch, dirty files, last commit (relative age), ahead/behind upstream.
+4. External (requires gh, config `brief.remote_checks`): open PRs authored/assigned, CI status of last pushed branch.
+5. Human-level unresolved observations. Items already presented elsewhere are labeled existing context rather than re-announced as new warnings.
 
----
+### `peer observe [--min-severity <s>] [--json]` / `peer observe <id> --ack|--dismiss`
 
-### `peer observe [--drain] [--min-severity <s>] [--json]`
-
-List queued observations. `--drain` advances the `cli` client's cursor past them, and no other client's, so reading the queue in a terminal never hides it from an open harness window.
+List human-level unresolved observations and their state.
 
 ```
-warning     auth.go:88 new branch on error path returns nil err (rule: ai-analysis, 12m ago)
-suggestion  auth_test.go not updated alongside auth.go (rule: test-sibling, 25m ago)
+42  warning     presented  auth.go:88 new branch on error path returns nil err
+45  suggestion  pending    auth_test.go not updated alongside auth.go
+peer observe 42 --ack
+peer observe 45 --dismiss
 ```
 
----
+Observation state belongs to the human, not to one harness window. Reading it from the CLI does not make another client announce it as new; clients separately track whether they have synchronized the current state.
+Acknowledgement means "I saw this; keep it unresolved context." Dismissal suppresses it globally. Resolution and staleness may happen automatically when the underlying condition no longer holds.
 
 ### `peer activity [--since 40m] [--json]`
 
@@ -268,30 +330,31 @@ git: 2 commits this session, last "handle token refresh" 52m ago, branch fix-aut
 
 ### `peer commit [flags]`
 
-Context-aware commit: stage, generate message, commit.
+Context-aware commit: identify a coherent logical change, stage it, generate the message, and commit.
 
 ```
 peer commit
 peer commit --staged          # only what is already staged
+peer commit --all             # explicitly treat every eligible change as one scope
 peer commit -m "override"     # skip generation
 peer commit --amend
-peer commit --dry-run         # print proposed staging + message, do nothing
+peer commit --dry-run         # print proposed grouping + staging + message, do nothing
 ```
 
 Behavior:
-1. Determine scope: staged changes if any, else all tracked modified files (`--staged` forces the former).
-2. Refuse empty scope.
-3. Generate message via LLM runner: diff + session narrative + last 10 commit subjects for style matching. One-line subject, body only when the why is not obvious.
-4. `git add` scope (if needed), `git commit -m` with generated message. User git config applies (signing, hooks). Never `--no-verify`, never `--no-gpg-sign`.
-5. Warn (do not stage) on sensitive-pattern files (`.env*`, `*.pem`, `*.key`, `credentials*`); require explicit `--include <file>`.
-6. Print the commit hash and message.
+1. Inspect staged, tracked, and untracked changes, excluding ignored and sensitive paths.
+2. `--staged` uses exactly the staged scope. Otherwise derive logical change groups from diff overlap, file activity, current goal/direction, recent decisions, and session chronology.
+3. If there is one high-confidence group, use it. If several unrelated groups remain or grouping confidence is low, fail closed before staging and print the proposed groups; the human can stage explicitly, use `--include`, or choose `--all`.
+4. Generate the message from the selected diff + structured work context + relevant attempts/outcomes + last 10 commit subjects for style matching. One-line subject, body only when the why is not obvious.
+5. Stage only the selected files (including relevant untracked files), then run normal `git commit`. User git config applies; never `--no-verify`, never `--no-gpg-sign`.
+6. Sensitive-pattern files (`.env*`, `*.pem`, `*.key`, `credentials*`) and secret-scanner hits are never auto-staged; require explicit `--include <file>` and still redact their content from model payloads.
+7. Print the commit hash, message, and files included.
 
 Errors:
 - Nothing to commit.
+- Ambiguous logical scope without an explicit human choice.
 - Not a git repo / detached state warnings.
-- LLM runner failure (falls back: print diffstat, ask human for a message via error text, never commit with a junk message).
-
----
+- LLM runner failure: print the proposed scope and diffstat and refuse the commit rather than manufacture a junk message.
 
 ### `peer review [flags]`
 
@@ -303,7 +366,7 @@ peer review --staged
 peer review --focus "error handling"
 ```
 
-Sends diff + session narrative to the LLM runner with a review prompt.
+Sends the selected diff + structured work context (goal, direction, decisions, attempts, outcomes) to the LLM runner with a review prompt.
 Output: findings with file:line, severity, one-line rationale.
 Findings are also queued as observations with `suppress_delivery` set, so the analyzer never re-flags them and no client is told twice.
 
@@ -314,13 +377,13 @@ Findings are also queued as observations with `suppress_delivery` set, so the an
 Teach what code does, with session context.
 
 `target`: `path`, `path:line`, `path:start-end`, or a symbol name (resolved via `git grep -n`).
-The prompt includes: the code slice, surrounding context, whether/when the human edited it this session, and recent related changes.
+The prompt includes: the code slice, surrounding context, whether/when the human edited it this session, the active goal/direction, relevant decisions, and recent related changes.
 
 ---
 
 ### `peer why <file:line>`
 
-Explain why a line is the way it is: `git log -L`/`git blame` + commit messages + linked PR (via gh when available), narrated by the LLM runner.
+Explain why a line is the way it is: `git log -L`/`git blame` + commit messages + linked PR (via gh when available) + matching structured decisions/outcomes from Peer memory, narrated by the LLM runner.
 
 ---
 
@@ -337,7 +400,7 @@ peer pr --base develop
 Behavior:
 1. Require clean tree or confirm `--allow-dirty`.
 2. Push current branch (`--no-push` to skip).
-3. Generate title + body from branch diff vs base + session narratives covering the branch's lifetime + commit list. Body format: Summary bullets, `Fixes #N` when a linked issue is inferable (never invented), Test plan.
+3. Generate title + body from branch diff vs base + typed goals/decisions/outcomes relevant across the branch lifetime + factual session/activity evidence + commit list. Body format: Summary bullets, `Fixes #N` when a linked issue is inferable (never invented), Test plan.
 4. `gh pr create`; print URL.
 
 ---
@@ -352,7 +415,8 @@ Prints the plan; the human runs it.
 
 ### `peer ask "<question>"`
 
-Freeform question answered with project + session context injected (narrative, git state, recent diff). One-shot LLM runner call.
+Freeform question answered with current work context, git state, and relevant code evidence injected.
+For questions about older work, `ask` uses the structured-memory query path rather than stuffing prose history into the prompt: a model may compose read-only SQL against the stable memory views, Peer validates and executes it locally, then the answer is grounded in the returned rows. This extra planning call is on-demand and therefore never budget-gated.
 
 ---
 
@@ -362,21 +426,23 @@ Internal shim: reads the harness hook payload on stdin, talks to the daemon over
 Sub-second, no LLM calls.
 
 ```
-peer hook claude session-start     # -> {"hookSpecificOutput":{"additionalContext": "<brief>"}}
-peer hook claude user-prompt-submit# -> this client's pending observations as additionalContext
-peer hook claude stop              # -> harness idle signal; never blocks stop
-peer hook claude session-end       # -> update client last_seen
-peer hook codex ...                # same pattern, codex payload shapes
+peer hook claude session-start      # -> {"hookSpecificOutput":{"additionalContext": "<brief>"}}
+peer hook claude user-prompt-submit # -> synchronize unresolved context as additionalContext
+peer hook claude stop               # -> harness idle signal; never blocks stop
+peer hook claude session-end        # -> update client last_seen
+peer hook codex ...                 # same pattern, codex payload shapes
 ```
 
 Event mapping, given that a harness client is not a work session:
 
 | Event | Effect |
 |---|---|
-| SessionStart | return the briefing, register or update the client; does not start a work session |
-| UserPromptSubmit | deliver this client's pending observations; counts as a liveness signal |
-| Stop | harness idle signal feeding the delivery policy's idle condition; no accounting (Stop fires on every agent turn, not once per session) |
+| SessionStart | return the briefing, register/update the client; does not start a work session |
+| UserPromptSubmit | record a liveness signal; persist a sanitized user-prompt evidence row when available; synchronize unresolved observation/context state. The hook itself never waits for an LLM. |
+| Stop | mark that harness client idle for delivery routing; no session accounting (Stop fires on every agent turn, not once per work session) |
 | SessionEnd | update the client's `last_seen`; never closes the work session |
+
+Raw model responses are not stored as memory by default. Project-scoped human prompt text is useful evidence for intent, so a sanitized prompt may be retained with the raw-event retention window; longer-lived intent is represented by typed facts extracted from it. Secret redaction runs before persistence as well as before outbound model calls.
 
 ---
 
@@ -387,9 +453,9 @@ Standard. `peer update` follows the secondhand/no-mistakes/treehouse pattern (Gi
 ## MCP server specification
 
 Transport: streamable HTTP at `http://127.0.0.1:7433/mcp` (config `mcp.port`), built on the official `modelcontextprotocol/go-sdk`.
-One daemon serves many concurrent harness clients; clients are distinguished per MCP session id and each carries its own observation cursor (see `## Session continuity`).
-`peer mcp-stdio` runs a stdio-to-daemon proxy for clients without HTTP support; the proxy forwards its own cwd so the daemon can route the session to the right project.
-The server does not depend on MCP sampling, resource subscriptions, or server-push notifications for anything load-bearing: no target harness implements the client side, and the 2026-07-28 spec revision deprecates sampling/roots/logging outright.
+One daemon serves many concurrent harness clients. Clients attach to the same project work context; an MCP session id identifies a delivery/synchronization client, never a separate work session.
+`peer mcp-stdio` runs a stdio-to-daemon proxy for clients without HTTP support; the proxy forwards its cwd so the daemon can route the request to the right project.
+The server does not depend on MCP sampling, resource subscriptions, or server-push notifications for anything load-bearing.
 When the claude Channels adapter is enabled, the server additionally declares the experimental `claude/channel` capability (an Anthropic extension, not core MCP).
 
 Project routing: every tool accepts an optional `directory` argument.
@@ -400,53 +466,87 @@ Tools (names use underscores; clients namespace them, e.g. `mcp__peer__commit`):
 
 | Tool | Args | Returns | Annotations |
 |---|---|---|---|
-| `commit` | `directory?`, `staged_only?`, `message_override?`, `amend?`, `dry_run?` | commit hash + message, or proposal when dry_run | destructive |
+| `commit` | `directory?`, `staged_only?`, `all?`, `message_override?`, `amend?`, `dry_run?` | commit hash + message, or grouping/proposal | destructive |
 | `review` | `directory?`, `staged_only?`, `focus?` | findings list | read-only |
 | `explain` | `target`, `directory?`, `level?` | explanation text | read-only |
-| `why` | `location`, `directory?` | history narration | read-only |
+| `why` | `location`, `directory?` | history + decision narration | read-only |
 | `pr_create` | `directory?`, `base?`, `draft?`, `no_push?` | PR URL | destructive |
 | `rebase_plan` | `directory?`, `base?` | step-by-step plan | read-only |
-| `ask` | `question`, `directory?` | answer | read-only |
-| `observations` | `directory?`, `min_severity?`, `drain?` | queued observations | read-only |
-| `briefing` | `directory?` | session briefing | read-only |
-| `activity` | `directory?`, `since?` | session narrative | read-only |
+| `ask` | `question`, `directory?` | grounded answer | read-only |
+| `observations` | `directory?`, `min_severity?` | unresolved observations + human-level state | read-only |
+| `observation_update` | `id`, `action=ack|dismiss`, `directory?` | updated observation | state mutation, no repo mutation |
+| `briefing` | `directory?` | work briefing | read-only |
+| `activity` | `directory?`, `since?` | factual activity narrative | read-only |
+| `context` | `directory?`, `purpose?` | structured context or sanitized outbound payload | read-only |
+| `focus_get` | `directory?` | current goal + provenance | read-only |
+| `focus_set` | `text`, `directory?` | explicit focus fact | state mutation, no repo mutation |
+| `focus_clear` | `directory?` | cleared explicit focus | state mutation, no repo mutation |
+| `memory_query` | `sql`, `directory?` | rows from stable read-only views | read-only |
 
 Design rules:
-- Tool descriptions teach the harness when to call them ("When the user asks to commit, call `commit` instead of running git yourself; peer has watched the session and writes better messages.").
+- Tool descriptions teach the harness when to call them ("When the user asks to commit, call `commit` instead of running git yourself; Peer has watched the session and can separate the logical scope.").
 - Tools that spend tokens say so in their description.
-- `commit` and `pr_create` carry destructive annotations so harnesses can gate them behind approval.
-- Structured content: tools return both human text and structured JSON (outputSchema) so harnesses can render or post-process.
-- `observations` returns what is pending for the calling client, and `drain` advances that client's cursor alone. `briefing` does the same for the observations it embeds.
+- `commit` and `pr_create` carry destructive annotations so harnesses can gate repository mutations behind approval.
+- No tool edits implementation files. `review`, `explain`, `why`, and `ask` may return complete suggested source code; applying it remains a human action.
+- Structured content: tools return both human text and structured JSON (`outputSchema`) so harnesses can render or post-process.
+- `memory_query` accepts only the guarded SQL subset documented under `## Structured memory and work context`; internal tables are not part of the MCP contract.
 
 Resources (optional, for clients that support them):
-- `peer://briefing` and `peer://activity` mirror the corresponding tools for @-mention style inclusion.
+- `peer://briefing`, `peer://activity`, and `peer://context` mirror the corresponding tools for @-mention style inclusion.
 
 Notifications: the server emits `notifications/tools/list_changed` only on upgrade.
-Proactive delivery does NOT rely on MCP server-push (client support for subscriptions/sampling is not dependable); it uses the adapters below.
+Proactive delivery does NOT rely on MCP server-push; it uses the adapters below.
 
 ## Adapter specification (proactive delivery)
 
 The daemon exposes an SSE feed: `GET http://127.0.0.1:7433/events?project=<root>`.
-Events: `observation` (with severity), `briefing_ready`, `away_return`.
-Adapters subscribe and inject according to harness capability.
+Events: `observation_state`, `briefing_ready`, `away_return`, `context_changed`.
+Adapters subscribe and inject according to harness capability, but routing and human-level presentation state live in the daemon.
 
 | Harness | Mechanism | Class |
 |---|---|---|
 | pi | extension subscribes to SSE, injects via `pi.sendMessage(..., {deliverAs: "steer", triggerTurn: true})` | push |
 | opencode | plugin subscribes to SSE, injects via `client.session.promptAsync` | push |
-| claude-code (stable) | hooks pull: SessionStart injects briefing, UserPromptSubmit delivers that client's pending observations into additionalContext; statusline shows queue depth ambiently | pull-at-turn |
+| claude-code (stable) | hooks pull: SessionStart injects briefing, UserPromptSubmit synchronizes unresolved context; statusline shows queue depth ambiently | pull-at-turn |
 | claude-code (preview) | Channels: MCP server declares experimental `claude/channel` capability; off by default until the feature exits research preview | push |
 | codex | hooks.json pull (UserPromptSubmit stdout context); `notify` key for desktop-notification degrade | pull-at-turn |
 | grok | hooks pull (event taxonomy mirrors claude; additionalContext support unconfirmed, verify before enabling) | pull-at-turn |
 | any-in-herdr | optional: `herdr pane send-text` when pane agent state is idle; `herdr notification` | push (terminal) |
-| none | desktop notification (`notify-send` / `osascript`), critical severity only | fallback |
+| none | desktop notification (`notify-send` / `osascript`) | fallback |
 
-Delivery policy (daemon-side, adapters stay dumb):
-- critical: push immediately on every available channel.
-- warning: push only when the session is idle (a harness Stop event or >=60s with no signal); otherwise queue.
-- suggestion/info: queue only; delivered at that client's next turn, next brief, or explicit `observe`.
-- Staleness: before delivery, re-verify the observation's file fingerprint; drop if the code changed.
-- Dedup: fingerprint(rule, file, normalized finding); once an observation with that fingerprint has been queued, it is never queued again, whether or not any client has seen it.
+### Human-level observation state
+
+A person may have several harness windows, but Peer is one peer. Observation lifecycle therefore belongs to the human:
+
+`pending -> presented -> acknowledged -> resolved`
+
+`dismissed` and `stale` are terminal alternatives.
+
+- `presented` records when and where the human was first shown the finding as new.
+- `acknowledged` means the human saw it but it remains unresolved context.
+- `resolved` is set when the condition is verified gone; `dismissed` is an explicit human choice; `stale` means the code fingerprint changed enough that the finding can no longer be trusted.
+- Client cursors synchronize state; they do not define whether the human has seen an observation.
+- A different harness may receive an already-presented unresolved item as ambient context, but never re-announce it as a fresh interruption.
+
+### Delivery policy
+
+- critical: bypass the non-critical attention cap and immediately route to the best currently active interactive surface. Use one primary interruption, not every channel. If no interactive surface is available, fall back to desktop notification. Other clients learn it as existing unresolved context.
+- warning: proactively present only while the human is idle and while the attention budget permits; otherwise queue. Multiple compatible warnings may be batched into one interruption.
+- suggestion/info: never interrupt; surface at the next natural turn, briefing, or explicit `observe`.
+- Staleness: before any presentation, re-verify the observation's file/work fingerprint; stale findings are dropped from delivery and marked stale.
+- Dedup: fingerprint(rule/profile, project, relevant files, normalized finding); once queued, the same finding is not re-created until the old condition resolves and later genuinely recurs.
+
+### Attention budget
+
+Human attention is independently budgeted from model quota.
+Defaults apply only to proactive non-critical interruptions:
+
+- at most `attention.max_proactive_per_day` (default 4) per local day across all projects and surfaces;
+- at least `attention.min_interval` (default 30m) between proactive interruptions;
+- warnings discovered within `attention.batch_window` (default 10m) are eligible to batch;
+- critical findings are exempt from the cap, but still obey the one-observation/one-primary-interruption rule.
+
+When the budget is exhausted, warnings remain unresolved and appear in the next natural turn/briefing. Nothing is discarded merely because the human chose quiet.
 
 ## Watcher specification
 
@@ -464,17 +564,23 @@ Triggers (all subject to `min_interval`, default 10m, and the budget gate):
 - quiescence: an edit burst (>=3 saves) followed by >=2m of silence.
 - volume: >=`analysis.file_threshold` files or >=`analysis.line_threshold` changed lines since last analysis.
 - staged: the index grew (imminent commit; jump the queue).
-- Never analyzes mid-burst, never re-analyzes an unchanged diff (input hash).
+- work-pattern: deterministic evidence indicates repeated reversals, unusually long churn on the same area, or goal/diff divergence worth a semantic check.
+- Never analyzes mid-burst and never re-analyzes an unchanged input hash.
 
-Input: unified diff since last analyzed state (capped, large diffs truncated file-by-file with a note) + session narrative + list of previously surfaced findings (to forbid repeats).
-Output contract: JSON array of `{severity, title, detail, file, line?, confidence}`; findings below `analysis.min_confidence` (default 0.6) are dropped; at most `analysis.max_observations` (default 5) queued per run.
+Input: current diff/evidence + structured work context + recent attempts/outcomes + unresolved/surfaced findings. Large diffs are capped file-by-file with an explicit truncation note. Secret/excluded content is sanitized before the runner sees it.
+Output contract: JSON array of `{severity, category, title, detail, file?, line?, confidence, evidence_refs[]}`; findings below `analysis.min_confidence` (default 0.6) are dropped; at most `analysis.max_observations` (default 5) queued per run.
 
-What it looks for (prompt profile, config-selectable): potential bugs, missed edge cases, test gaps, style drift vs the surrounding file, dead/leftover debug code.
+Two observation families are first-class:
+
+- **Code observations:** potential bugs, missed edge cases, test gaps, style drift against surrounding code, dead/leftover debug code, contract mismatches.
+- **Work observations:** repeated failed/reverted approaches, scope drift away from the stated goal, an assumption invalidated by later edits, a changed contract with no subsequent verification signal, an unfinished thread before a long away period, or a likely next check that has been forgotten.
+
+The analyzer must ground work observations in stored evidence and context facts; it cannot invent intent from vibes. Low-confidence intent inference is stored as an inferred fact with provenance, not silently promoted to truth.
 
 Every run is gated by the budget gate below.
 Intensity presets set trigger thresholds and model tier:
-- off: no analyzer, mechanical rules only.
-- light: staged trigger only, small model.
+- off: no analyzer, mechanical rules and structured context only.
+- light: staged + high-signal work-pattern triggers, small model.
 - standard (default): all triggers, small model.
 - eager: all triggers, tighter intervals, mid model.
 
@@ -557,41 +663,114 @@ Per-purpose model map: `llm.models.analysis`, `llm.models.commit`, `llm.models.r
 
 Each rule: one Go function over watcher/git state, individually toggleable in config.
 
+## Structured memory and work context
+
+SQLite is Peer's canonical memory, not a backing store for prose summaries.
+The model should query structure when structure can answer the question.
+
+### Memory layers
+
+1. **Evidence:** append-oriented facts Peer can observe directly: file events/aggregates, git transitions, sanitized project-scoped human harness prompts/signals, tool invocations, session/away intervals, analysis runs, observation presentations. Raw model responses are not persisted by default.
+2. **Work context:** typed semantic facts describing what the human is doing: `goal`, `direction`, `decision`, `question`, `attempt`, `outcome`, `constraint`, and `convention`.
+3. **Derived views/summaries:** compact briefings and narration generated from the first two layers. They are caches and may be rebuilt; they are never the sole canonical copy of an important fact.
+
+A work-context fact carries at least:
+
+`id, project_id, session_id?, kind, text, status, confidence, source_type, source_ref?, explicit, created_at, superseded_by?`
+
+Relations are stored separately so facts can form a small ontology without embedding prose blobs:
+
+`(subject_fact_id, relation, object_fact_id)` where relation is one of `supports`, `blocks`, `replaces`, `answers`, `tests`, `derived_from`, or another schema-versioned relation.
+
+Facts are append/supersede by default. An LLM-produced consolidation may add typed facts or mark a fact as superseded with provenance; it may not silently hard-delete evidence or canonical facts. Human `forget` commands are the deletion authority.
+
+### Provenance and precedence
+
+When sources disagree, current context prefers:
+
+1. explicit human-set facts (`peer focus`, explicit harness statement captured as such);
+2. explicit linked issue/PR/task metadata;
+3. high-confidence harness-context extraction;
+4. branch/commit inference;
+5. filesystem/git-pattern inference.
+
+Inference never overwrites stronger evidence. It creates a new fact, relation, or supersession edge with confidence and source so the human can inspect why Peer believes something.
+
+### SQL retrieval contract
+
+Common context assembly uses deterministic prepared SQL written in Go.
+For open-ended historical questions, the harness or LLM may compose SQL rather than "vibe-search" memory.
+Peer exposes stable read-only views, versioned as part of the public memory-query contract:
+
+- `memory_facts` — typed facts with project/session names and provenance;
+- `memory_relations` — semantic links between facts;
+- `memory_sessions` — work sessions and away intervals;
+- `memory_activity` — per-file/session activity aggregates;
+- `memory_observations` — current and historical human-level observation state;
+- `memory_decisions` — active/superseded decision facts plus provenance.
+
+`memory_query` is guarded:
+
+- execute on a read-only connection with `PRAGMA query_only = ON`;
+- accept one `SELECT` or `WITH ... SELECT` statement only; no PRAGMA, ATTACH, virtual-table creation, extension loading, or multiple statements;
+- expose stable views, not writable/internal tables; a SQLite authorizer/allowlist denies internal tables, `sqlite_schema`, extension/file helpers, and unsafe functions even for SELECT;
+- default row limit 200 and hard maximum 1000;
+- query timeout default 500ms;
+- return typed rows plus the schema version used.
+
+For `peer ask` historical recall, Peer may use a two-step on-demand flow: give the model the stable view schema and question, require SQL-only output, validate/execute it, then answer from the rows. SQL generation failure degrades to deterministic context retrieval; it never broadens filesystem access.
+
+### Consolidation ("dreaming")
+
+Optional consolidation is taxonomy-constrained, never freeform memory gardening.
+At session close or during idle budget, a model may propose structured facts such as a decision, outcome, supersession, or unanswered question from stored evidence.
+Every proposal must include `kind`, `text`, `confidence`, and `evidence_refs`; invalid taxonomy or missing provenance is rejected.
+Consolidation never deletes raw evidence and never decides by itself that an explicit human fact is obsolete.
+
+### V1 memory scope
+
+V1 prioritizes activity memory plus short-lived/project-scoped work context. Durable project conventions are supported by the schema but should only be promoted from explicit statements or repeated high-confidence evidence; there is no attempt to build a personality profile.
+Embeddings/vector search are intentionally absent until SQL + git/grep are proven insufficient.
+
 ## Session continuity
 
 Peer has exactly one kind of session.
-A **work session** is a contiguous activity window per project, owned by the watcher, and it exists whether or not any harness is running.
-Harness connections are **clients**, never sessions: a client attaches to whatever work session is in progress, and several clients can attach to the same one.
-This is what makes peer's account of the day identical whether the human worked in an editor alone, in one claude window, or in three at once.
+A **work session** is a contiguous work window per project, owned by Peer, and it exists whether or not any harness is running.
+Harness connections are **clients**, never sessions: several clients can attach to the same work session and structured context.
+This keeps Peer's account of the day identical whether the human worked in an editor alone, in one Claude window, or in three harnesses at once.
 
 ### Work sessions
 
 - Liveness is one `last_signal_at` per project, fed by every peer-visible signal: debounced file saves, git state changes, harness hook events, MCP tool calls, and CLI invocations.
-- Away when no signal for `session.away_threshold` (default 15m); return on the next signal, with the gap recorded on the session.
-- A session closes on an away-threshold crossing or on daemon shutdown, and on nothing else. No harness signal ever closes one: a claude window closing is not the human stopping work.
-- At session close: write a compact summary row (files touched, churn, commits made, observations delivered, one-line LLM narration when the budget gate allows).
-- "Where you left off" in a briefing is the last closed work session for that project, so there is no tiebreak to make.
+- After `session.away_threshold` (default 15m) with no signal, the session enters `away`; it does **not** close. A return before the close threshold records the away gap and resumes the same work session.
+- After `session.close_threshold` (default 2h) with no signal, the work session closes at the threshold boundary. The next signal opens a new work session. Daemon shutdown also closes the active session.
+- No harness event closes a work session: a window closing is not the human stopping work.
+- At close: persist factual aggregates immediately. An optional quota-gated consolidation/narration pass may add typed outcome/question facts and a derived summary, but failure leaves the factual session complete.
+- "Where you left off" is the last closed work session plus the current project context; a long lunch does not invent a new session, while an afternoon-to-evening break does.
 
 ### Clients
 
-- Table `clients`: `(id, harness, project, first_seen, last_seen, cursor)`, keyed per client-and-project pair.
-- Identity is the MCP session id for MCP clients, the harness payload's session id for hook shims, and the fixed pseudo-id `cli` for the CLI.
-- A new client's cursor initializes to the first observation id of the work session in progress, or to the next id to be issued when the session has queued none yet. It sees the session it is joining and no older backlog.
-- Clients unseen for 7 days are pruned; a returning id re-initializes exactly like a new one.
+- Table `clients`: `(id, harness, project, first_seen, last_seen, observation_cursor)`, keyed per client-and-project pair.
+- Identity is the MCP session id for MCP clients, the harness payload's session id for hook shims, and fixed pseudo-id `cli` for the CLI.
+- The cursor means "this client has synchronized observation state through id N". It is not the human presentation/acknowledgement state.
+- A new client starts from the first unresolved observation relevant to the current work session, plus any older acknowledged-but-unresolved item that the context composer selects as relevant. Those arrive as existing context unless never presented to the human.
+- Clients unseen for 7 days are pruned; a returning id reinitializes like a new client without changing human-level observation state.
 
-### Observation delivery
+### Observation persistence and presentation
 
-- Observations are an append-only log with monotonic ids.
-- A client receives observations with `id > cursor`, minus globally dismissed, minus stale by fingerprint re-check, minus those below its severity floor. The cursor advances past everything considered, whether or not each item passed the filters.
-- Dismissal and staleness are global. The cursor only records who has seen what, so two windows on one project each receive an observation exactly once and neither hides it from the other.
-- Analyzer suppression keys on the fingerprint of any observation ever queued, independent of who has seen it.
-- `peer review` findings are queued with `suppress_delivery` set: they exist so the analyzer will not re-flag them, and no cursor ever delivers them.
+- Observations are append-oriented with monotonic ids and a global lifecycle: pending, presented, acknowledged, resolved, dismissed, or stale.
+- `observation_presentations` records each surface synchronization/presentation, including whether it was the primary interruption or ambient context.
+- Exactly one presentation may claim `primary_interrupt = true` for a newly surfaced observation unless an explicit escalation policy later retries an unseen critical item.
+- Dismissal, acknowledgement, resolution, staleness, and dedup are global human-level state.
+- Analyzer suppression keys on the fingerprint of any observation ever queued until that condition is resolved; a genuinely recurring condition may create a new occurrence after resolution.
+- `peer review` findings are stored with `suppress_proactive = true`: they remain queryable context and suppress analyzer duplicates, but are not proactively announced because the human just asked for the review.
 
 ### Persistence
 
-- Persisted: sessions, summaries, clients and their cursors, observations with their dismissal state, analysis findings history, run-cap and spend counters.
-- Re-derived live, never persisted: git status, branch, diff, PR/CI state.
-- Retention: raw events pruned after `store.retain_days` (default 14); sessions, observations, and spend rows kept 90 days; clients pruned after 7 days unseen; store vacuumed weekly.
+- Persisted: work sessions/away intervals, clients, evidence/activity, typed context facts/relations, observations/presentations, analysis history, run-cap/spend counters, attention counters, and projects.
+- Re-derived live, never persisted as canonical truth: current git status/diff and remote PR/CI state. Snapshots may be retained only as evidence references where needed to explain a historical fact.
+- Retention defaults: raw high-volume events 14 days; sessions, facts, observations, presentations, analyses, and spend 90 days unless explicitly promoted/project-scoped; clients 7 days unseen. Vacuum weekly.
+- Human forget/reset commands override retention immediately and cascade through derived summaries/relations.
 
 ## Configuration (`~/.config/peer/config.toml`)
 
@@ -620,8 +799,23 @@ reserve_floor = 30         # percent remaining; below this, background analysis 
 max_runs_per_day = 24      # bound when no probe; also the runaway backstop
 probe_cache = "60s"
 
+[attention]
+max_proactive_per_day = 4  # non-critical primary interruptions, global across projects
+min_interval = "30m"
+batch_window = "10m"
+
 [session]
 away_threshold = "15m"
+close_threshold = "2h"
+
+[memory]
+query_row_limit = 200
+query_max_rows = 1000
+query_timeout = "500ms"
+
+[privacy]
+redact_secrets = true
+exclude = []                # extra globs never included in model payloads
 
 [rules]
 uncommitted_after = "40m"
@@ -637,42 +831,50 @@ ignore = []
 auto_register = true
 ```
 
-Per-project `.peer.toml` may override `[analysis]`, `[rules]`, `[watch]`, `[brief]`.
-`[budget]` is user-global and not overridable per project: the quota it defends is shared across every project the daemon watches.
+Per-project `.peer.toml` may override `[analysis]`, `[rules]`, `[watch]`, `[brief]`, `[privacy].exclude`, and project-scoped context behavior.
+`[budget]` and `[attention]` are user-global and not overridable per project: model runway and human attention are shared resources.
 
 ## State management
 
-- Single sqlite database (modernc.org/sqlite, pure Go, WAL mode). Tables: events, file_activity, observations, sessions, clients, analyses, spend, projects, kv.
-- The daemon is the only writer. CLI and hook shims talk to the daemon over the control socket; they never open the db for writes (read-only fallback when the daemon is down: status/activity still work).
-- Atomic config edits (temp + rename). No lock files beyond the daemon pidfile flock.
+- Single SQLite database (`modernc.org/sqlite`, pure Go, WAL mode). Canonical tables include: `projects`, `sessions`, `away_intervals`, `events`, `file_activity`, `context_facts`, `context_relations`, `observations`, `observation_presentations`, `clients`, `analyses`, `spend`, `attention_events`, and `kv`/schema metadata.
+- SQLite is intentionally the structured memory substrate. Prose summaries are derived artifacts; deleting a summary cannot delete the facts it summarized.
+- Stable `memory_*` read-only views form the query contract for harness/LLM SQL. Internal table names and migrations are not exposed as API promises.
+- The daemon is the only writer. CLI and hook shims request mutations over the control socket; they never open the DB for writes.
+- Read-only status/activity/context/memory queries may fall back to a read-only DB connection when the daemon is down. SQL memory queries always enable `query_only` and the statement guard.
+- Migrations are transactional and monotonic. Structured fact taxonomy/relation changes carry a schema version so old provenance remains interpretable.
+- Atomic config edits (temp + rename). The daemon control socket is the single-instance authority; no independent application-level DB lock protocol.
 
 ## Error handling
 
 - Fail closed on mutations: commit refuses empty scope and junk messages; pr refuses unpushed surprises; nothing destructive without an explicit human-initiated call.
-- Fail open on observation: watcher errors degrade to polling; analyzer errors skip the run and log; a broken adapter never block the daemon.
+- Fail open on awareness: watcher errors degrade to polling; analyzer/consolidation errors skip that pass and log; a broken adapter never blocks the daemon. Canonical evidence collection continues whenever possible.
 - Hook shims always exit 0 with valid harness JSON (a broken peer must never break the human's harness); errors go to the daemon log.
 - Exit codes: 0 success, 1 error, 2 usage, 3 precondition failed.
 - Errors to stderr, structured output to stdout.
 
 ## Testing strategy
 
-- Unit: debounce/coalesce, gitignore filtering, rule engine table tests, narrative derivation, prompt assembly (golden files), message generation JSON parsing, config validation, observation dedup/staleness.
+- Unit: debounce/coalesce, gitignore filtering, mechanical rules, work-context precedence/supersession, relation validation, narrative/context derivation, prompt assembly, commit grouping, secret redaction, config validation, observation dedup/staleness.
+- Memory/SQL: migration tests; stable-view golden schemas; query guard rejects writes/PRAGMA/ATTACH/multiple statements; row/timeout bounds; typed row encoding; forget/reset cascades; derived summaries rebuild from canonical facts.
 - Budget: gate table tests across reading-present, reading-absent, and floor-boundary equality; run-cap rollover at local midnight; usage extraction from recorded runner output.
-- Sessions and delivery: liveness per signal kind; away and return at the threshold boundary; cursor initialization for a client arriving mid-session and for one arriving before any session exists; two clients each receiving an observation exactly once; a dismissed observation skipped by both cursors; cursor advancing past filtered items; client prune and re-registration.
-- Integration: temp git repos with scripted edit sequences -> expected events/aggregates/rules; daemon lifecycle (start, signal handling, single-instance); MCP server exercised with an MCP client library (list/call each tool); hook shims with recorded harness payloads.
-- LLM calls mocked via the command template (point `llm.command` at a fixture script); the quota probe mocked the same way, with fixtures for ok, malformed, timeout, and non-zero exit.
-- e2e (tagged): real `claude -p` smoke test for commit message generation, real `gh` mocked.
+- Attention/delivery: global non-critical cap, batching, min interval, critical best-surface routing, exactly one primary interruption, second client receives existing context without duplicate announcement, acknowledge/dismiss/resolve/stale transitions.
+- Sessions: away does not close; return before close threshold resumes same session; crossing close threshold creates a new session on next signal; daemon shutdown closes active session; harness SessionEnd never closes work.
+- Privacy: excluded files never enter outbound payloads; inline secret fixtures are redacted; `peer context --purpose` exactly matches the sanitized payload handed to the runner.
+- Integration: temp git repos with scripted edit/revert/scope-drift sequences -> expected activity, context, grouping, rules, and work observations; daemon lifecycle; MCP list/call each tool; hook shims with recorded harness payloads.
+- LLM calls mocked via the command template. Historical `ask` tests mock SQL-planner output including valid SELECT, invalid mutation, malformed SQL, timeout, and fallback retrieval.
+- e2e (tagged): real `claude -p` smoke test for commit/context-aware answer generation, real gh mocked.
 
 ## What is NOT in scope
 
 | Cut | Why |
 |---|---|
-| Writing or editing code | Definitional. Peer assists; the human codes. |
-| Autonomous task execution | That is secondhand's job. |
-| Editor plugins (VS Code, JetBrains) | Terminal-first; editors reach peer through their harness's MCP. Maybe later. |
-| PR review bot / CI integration | Peer reviews uncommitted local work; CodeRabbit et al own the PR lane. |
-| Keystroke-level completion | Save-granularity only. Copilot owns keystrokes. Future: LSP server for editor-agnostic completions (post-v1, see below). |
-| Embeddings / vector search of the codebase | The narrative is small and structured; grep and git cover retrieval. Revisit only with proven need. |
+| Editing implementation files | Definitional. Peer may return snippets, complete files, or patch-shaped suggestions, but the human applies them. |
+| Autonomous task execution | That is secondhand/harness-agent territory. Peer maintains context and assists the human doing the work. |
+| Keystroke-level completion / LSP autocomplete | Copilot/editor completion owns keystrokes. This is intentionally not on the Peer roadmap; adding it would blur the product boundary. |
+| Multi-agent orchestration | Multiple agents/harnesses may share Peer context, but conversational/orchestrator/worker topology belongs to the harness or secondhand, not Peer. |
+| Editor-specific plugins (VS Code, JetBrains) | Terminal/harness-first. Editors reach Peer through MCP/harness integrations; reconsider only for capabilities impossible through those surfaces. |
+| PR review bot / CI integration | Peer reviews local work and preserves its why; CodeRabbit-class tools own the remote PR-bot lane. Remote CI status is read-only briefing evidence. |
+| Embeddings / vector memory | Typed SQLite memory + SQL + git/grep are the default retrieval stack. Add embeddings only after a measured retrieval failure that relational structure cannot solve. |
 | Multi-user / remote server | One daemon per user per machine, localhost only. |
 | Windows | Linux + macOS first. |
 | Telemetry | None, ever. |
@@ -683,7 +885,7 @@ Per-project `.peer.toml` may override `[analysis]`, `[rules]`, `[watch]`, `[brie
 |---|---|---|
 | `spf13/cobra` | CLI subcommands | de facto standard for multi-command Go CLIs; matches secondhand |
 | `fsnotify/fsnotify` | filesystem events | the primitive every mature Go watcher uses; recursion hand-rolled (upstream has none) |
-| `modernc.org/sqlite` | context store | pure Go (no cgo), trivial cross-compilation; perf gap vs mattn irrelevant at this write rate |
+| `modernc.org/sqlite` | canonical structured memory + query views | pure Go (no cgo), trivial cross-compilation; relational querying/provenance is a product feature, not incidental persistence |
 | `pelletier/go-toml/v2` | config | active, fast; `gopkg.in/yaml.v3` is archived and TOML fits a hand-edited dotfile better |
 | `adrg/xdg` | state/config/runtime paths | correct XDG handling across Linux/macOS |
 | `modelcontextprotocol/go-sdk` | MCP server | official SDK, first-class Streamable HTTP, already tracks the 2026-07-28 spec revision; github-mcp-server is migrating to it |
@@ -699,46 +901,30 @@ Same pipeline as secondhand/no-mistakes/treehouse: release-please, conventional 
 
 ## Implementation plan
 
-### Phase 1: watch and remember (zero tokens end-to-end)
-1. `peer daemon` foreground: watcher, git state, store, away detection.
-2. `peer project add/list/remove`, `peer status`, `peer activity`.
-3. Mechanical rules + observation queue + `peer observe`.
-Deliverable: run the daemon for a day, `peer activity` tells the true story of the session.
+### Phase 1: watch, remember, and expose context (zero tokens end-to-end)
+1. `peer daemon` foreground: watcher, git state, SQLite migrations/store, work-session away/close lifecycle.
+2. Structured evidence + work-context schema, stable `memory_*` views, query guard, `peer focus`, `peer context`, `peer memory`, forget/reset.
+3. `peer project add/list/remove`, `peer status`, `peer activity`.
+4. Mechanical rules + human-level observation lifecycle + `peer observe`.
+Deliverable: run the daemon for a day; `peer activity` tells the factual story, and `peer context` tells what the human is trying to do without a prose memory file.
 
-### Phase 2: on-demand tools
-4. LLM runner + `peer commit` + `peer review` + `peer ask`.
-5. MCP server (streamable HTTP) exposing the phase-2 verbs + `activity`/`observations`/`briefing`.
-6. `peer connect claude` (MCP registration + hooks) and `peer hook claude *` shims.
-Deliverable: from inside claude-code, "commit this" produces a context-aware commit through peer.
+### Phase 2: on-demand assistance
+5. Privacy sanitizer + LLM runner + context composer.
+6. `peer commit` with logical grouping, `peer review`, `peer ask` including guarded SQL historical recall.
+7. MCP server exposing context/focus/memory plus phase-2 verbs; `peer connect claude` and hook shims.
+Deliverable: from inside a fresh Claude Code window, "commit this" uses the work Peer already observed, while a historical question can query structured memory instead of requiring a pasted recap.
 
-### Phase 3: proactive loop
-7. Analyzer: triggers, budget gate (probe, floor, run cap, accounting), prompt, observation output.
-8. Briefing assembly + away/return summaries (+ gh remote checks).
-9. Delivery policy + SSE feed + opencode plugin + pi extension + desktop fallback.
-Deliverable: peer taps your shoulder, usefully, at most a few times a day.
+### Phase 3: proactive awareness
+8. Work-context inference/extraction with taxonomy + provenance; optional constrained session consolidation.
+9. Analyzer: code observations + work observations, triggers, quota gate, accounting.
+10. Briefing assembly + human-level delivery state + attention budget + SSE adapters + desktop fallback.
+Deliverable: Peer notices both code risks and work-shape risks, taps the human usefully at most a few non-critical times a day, and never repeats the same warning merely because another harness is open.
 
 ### Phase 4: polish
-10. `peer explain`, `peer why`, `peer pr`, `peer rebase`.
-11. codex/grok adapters, stdio proxy, statusline.
-12. Docs, e2e, release pipeline.
+11. `peer explain`, `peer why`, `peer pr`, `peer rebase` using structured decisions/outcomes where relevant.
+12. OpenCode/Pi/Codex/Grok adapters, stdio proxy, statusline.
+13. Docs, e2e, release pipeline.
 
 ## Design decisions
 
 Design decisions for this project, including the LLM default and the proactive delivery default, are recorded in `DECISIONS.md`.
-
-## Future considerations (post-v1)
-
-### LSP auto-complete server
-
-Peer's watcher and context store position it to provide editor-agnostic code completions via LSP (Language Server Protocol).
-Every modern editor speaks LSP natively, so no per-editor plugin is needed.
-
-Architecture fit:
-- The watcher already has file context, edit history, and git state.
-- Mechanical rules could power instant pattern-based completions (<50ms).
-- Cached analytical observations from background analysis could fuel richer suggestions.
-- `textDocument/completion` is the standard LSP hook; users configure their editor to point at peer's LSP server.
-
-This would be a fourth interface alongside CLI, MCP, and harness adapters.
-Adds an LSP server to the daemon (same process, separate port or stdio), reusing the store and narrative.
-Not in v1 because the MCP+CLI surface already covers the high-value tools; completions are a separable concern that benefits from a stable watcher and analyzer first.
